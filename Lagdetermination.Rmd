@@ -1,0 +1,824 @@
+
+The following lag determination code was provided by Associate Professor Erik Vanhatalo to whom I owe my thanks.
+The code was updated with regards to some packages, but the functions are unchanged.
+
+
+This code snippet contains the necessary packages to carry out lag determination via the methods developed by
+Vanhatalo et al., Rato & Reis and and Ku et al. 
+```{r}
+library(MASS)
+library(paran)
+library(MTS)
+library(ppcor)
+library(readxl)
+library(corrplot)
+library(qcc)
+library(forecast)
+library(rARPACK)
+library(elasticnet)
+library(plot3D)
+library(Hmisc)
+
+par(mar=c(1,1,1,1))
+
+###################################################
+###################################################
+### THE CODE STARTS WITH FUNCTIONS NEEDED FOR   ###
+### THE EXAMPLES BELOW                          ###
+###################################################
+###################################################
+####################################################### FUNCTION
+################################################################
+###################################################
+### FUNCTION - SIMULATING VAR(1) DATA           ###
+###################################################
+### INPUTS:                                     ###
+### p = number of variables                     ###
+### obs = number of observations                ###
+### burn = Number of initial observations to    ###
+###        'burn'                               ###
+### mu = Mean of the errors                     ###
+### sigma = covariance matrix of the errors     ###
+### phi = Matrix with autocorr. coeff.          ###
+###                                             ###
+### OUTPUT:                                     ###
+###   A matrix with VAR(1) data                 ###
+###################################################
+var1.sim <- function(p,obs,burn,mu,sigma,phi){
+  x1 = matrix(rep(0),(obs+burn),p)
+  e1 = mvrnorm((obs+burn),mu,sigma)
+  x1[1,] = mu
+  
+  for (k in 2:(obs+burn)){
+    x1[k,] = phi %*% x1[(k-1),] + e1[k,] # VAR(1)
+  }
+  x1 = x1[(burn+1):(obs+burn),] #burns first obs.
+  x1
+}
+
+####################################################### FUNCTION
+################################################################
+###################################################
+###################################################
+###           SIMULATED VMA DATA                ###
+###       Using Tsay's 'MTS' package            ###
+###                                             ###
+### INPUTS EXPLAINED:                           ###
+###   noobs = Sample size                       ###
+###   arlags = The exact lags of the VAR matrix ###
+###   polynomial.                               ###
+###   malags = The exact lags of the VMA matrix ###
+###   polynomial.                               ###
+###   cnst = Constant vector, Phi0              ###
+###   phi = Array of VAR coefficient matrices   ###
+###   in the order of the given arlags.         ###
+###   theta = Array of VMA coefficient matrices ###
+###   in the order of the given malags.         ###
+###   skip = The number of initial data to be   ###
+###   omitted. Deafult is skip = 200.           ###
+###   sigma = Covariance matrix (k-by-k,        ###
+###   positive definite) of the innovations.    ###
+###################################################
+###################################################
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### ADDING A SHIFT TO VAR(1) DATA IN PHASE II   ###
+### THE FUNCTION CREATES BOTH PHASE I AND       ###
+### PHASE II DATA                               ###
+###################################################
+### INPUTS:                                     ###
+### p = number of variables                     ###
+### mu1 = Mean of the errors (in Phase I)        ###
+### sigma = covariance matrix of the errors     ###
+### phi = Matrix with autocorr. coeff.          ###
+### obs1 = number of obs. Phase I               ###
+### burn = Number of initial observations to    ###
+###        'burn'                               ###
+### obs2 = number of obs. Phase II              ###
+### shf = Row vector, shifts in std. dev. units ###
+### shf_obs = shift intruced at a specific obs 
+###           in Phase II.
+### OUTPUT:                                     ###
+###   A matrix with Phase I and Phase II data   ###
+###################################################
+VAR1_shift_PI_PII <-function(p,mu,sigma,phi,obs1,burn,obs2,shf,shf_obs){
+  
+  ecov<-solve(diag(p^2)-kronecker(phi, phi)) # Inv. of expression in Reinsel (1993)
+  stsigma<-cbind(stack(as.data.frame(sigma))[,1]) # Stacking sigma
+  dfg<-ecov%*%stsigma
+  ncov<-matrix(c(dfg),p,p) # Creating matrix again, the "true" covariance matrix.
+  mu2 <- as.vector(mu1+shf*sqrt(diag(ncov))) # New mean of the process.
+  errshf = as.vector((diag(p)-phi)%*%mu2)
+  
+  # Simulating data in Phase I
+  
+  x1 = matrix(rep(0),(obs1+burn),p)
+  e1 = mvrnorm((obs1+burn),mu,sigma)
+  x1[1,] = mu
+  
+  for (k in 2:(obs1+burn)){
+    x1[k,] = phi %*% x1[(k-1),] + e1[k,] # VAR(1)
+  }
+  x1 = x1[(burn+1):(obs1+burn),] #burns first obs.
+  
+  
+  # Simulating data in Phase II
+  x2 = matrix(rep(0),obs2,p)
+  e21 = mvrnorm((shf_obs-1),mu,sigma) # Errors before shift in Phase II
+  e22 = mvrnorm(obs2,errshf,sigma) # Errrors after shift
+  
+  if (shf_obs < 2) {
+    x2[1,] = phi %*% x1[obs1,] + e22[1,] # First value in Phase II
+    
+    for (k in 2:obs2){
+      x2[k,] = phi %*% x2[(k-1),] + e22[k,]
+    }
+    
+  }
+  
+  if (shf_obs > 1) {
+    x2[1,] = phi %*% x1[obs1,] + e21[1,] # First value in Phase II
+    
+    for (k in 2:(shf_obs-1)){
+      x2[k,] = phi %*% x2[(k-1),] + e21[k,] # Shift has not yet occured
+    }
+    for (k in shf_obs:obs2){
+      x2[k,] = phi %*% x2[(k-1),] + e22[k,] # Shift has occurred
+    }
+  }
+  
+  res = matrix(rep(0),(obs1+obs2),p) #Combining Phase I and Phase II data
+  res[1:obs1,]=x1
+  res[(obs1+1):(obs1+obs2),]=x2
+  res
+}
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### ADDING A SHIFT TO VMA(1) DATA IN PHASE II   ###
+### THE FUNCTION CREATES BOTH PHASE I AND       ###
+### PHASE II DATA                               ###
+###################################################
+### INPUTS:                                     ###
+### p = number of variables                     ###
+### mu1 = Mean of the errors (in Phase I)       ###
+### sigma = covariance matrix of the errors     ###
+### theta = Matrix with MA(1) coeff.            ###
+### obs1 = number of obs. Phase I               ###
+### burn = Number of initial observations to    ###
+###        'burn'                               ###
+### obs2 = number of obs. Phase II              ###
+### shf = Row vector, shifts in std. dev. units
+### shf_obs = shift intruced at a specific obs 
+###           in Phase II.
+### OUTPUT:                                     ###
+###   A matrix with Phase I and Phase II data   ###
+###################################################
+VMA1_shift_PI_PII <-function(p,mu1,sigma,theta,obs1,burn,obs2,shf,shf_obs) {
+  #Calculating shift size in terms of true standard deviations of the variables
+  
+  covMA1 = sigma +(theta %*% sigma %*% t(theta)) #true Covariance matrix
+  mu2 <- as.vector(mu1+(shf*sqrt(diag(covMA1)))) #new mean of the process
+  ##errshf = mu2as.vector(mu2 %*% (diag(p)%/%theta)) 
+  
+  # Simulating data in Phase I
+  
+  x1 = matrix(rep(0),(obs1+burn),p)
+  e1 = mvrnorm((obs1+burn),mu1,sigma)
+  
+  x1[1,] = mu1 +e1[1,]
+  
+  for (k in 2:(obs1+burn)){
+    x1[k,] = mu1 + e1[k,] - theta %*% e1[(k-1),]
+  }
+  x1 = x1[(burn+1):(obs1+burn),] #burns first obs.
+  
+  # Simulating data in Phase II
+  x2 = matrix(rep(0),obs2,p)
+  e2 = mvrnorm(obs2,mu1,sigma) # New errors in Phase II (shifts in mean of errors)
+  
+  if (shf_obs < 2) {
+    x2[1,] = mu2 + e2[1,]- theta %*% e1[obs1,] # First value in Phase II (connecting with Phase I)
+    
+    for (k in 2:obs2){
+      x2[k,] = mu2 + e2[k,] - theta %*% e2[(k-1),]
+    }
+  }
+  
+  if (shf_obs > 1) {
+    x2[1,] = mu1 + e2[1,]- theta %*% e1[obs1,] # First value in Phase II (connecting with Phase I)
+    
+    for (k in 2:(shf_obs - 1)) {
+      x2[k,] = mu1 + e2[k,] - theta %*% e2[(k-1),]
+    }
+    for (k in shf_obs:obs2){
+      x2[k,] = mu2 + e2[k,] - theta %*% e2[(k-1),]
+    }
+  }
+  
+  
+  res = matrix(rep(0),(obs1+obs2),p) #Combining Phase I and Phase II data
+  res[1:obs1,]=x1
+  res[(obs1+1):(obs1+obs2),]=x2
+  res
+}
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### FUNCTION - ADDING LAGS TO A MATRIX          ###
+###################################################
+### INPUTS:                                     ###
+###   X = Original matrix                       ###
+###   lags = Number of lags to add              ###
+### OUTPUT:                                     ###
+###   A lagged matrix, 'trimmed' due to lagging ###
+###################################################
+Xlag <- function(X,lags){
+  p = dim(X)[2] # Number of variables.
+  obs = dim(X)[1] # Number of obs.
+  
+  for (i in 1:lags){
+    
+    Xlag = matrix(rep(0),obs+i,(p*i)+p)
+    
+    for (l in 0:i){
+      Xlag[(l+1):(obs+l),((l*p)+1):((l*p)+p)]=X
+    }
+    
+    Xlag = Xlag[(i+1):obs,] #trims the matrix
+  }
+  Xlag
+}
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### PERCENT OF VARIANCE EXPLAINED               ###
+### BY PCA (CORRELATION MATRIX                  ###
+###################################################
+### INPUTS:                                     ###
+### X = Data Matrix                             ###
+###                                             ###
+### OUTPUT:                                     ###
+###   A plot with the cumulative variance       ###
+###   explained of the PCs                      ###
+###################################################
+pca.var.expl <- function (X){
+  
+  eigval = (princomp(X, cor=TRUE)$sdev)^2
+  
+  Sum_eigval = sum(eigval)
+  
+  percent = (eigval/Sum_eigval)*100
+  
+  Sum_percent = rep(0,length(eigval))
+  Sum_percent[1]=percent[1]
+  
+  for (i in (2:(length(eigval)))){
+    Sum_percent[i]=Sum_percent[i-1] + percent[i]  
+  }
+  #plot(Sum_percent,type="o",xlab="Eigenvalue number",
+  #    ylab = "% variance explained")
+  #title(main="Variance explained")
+  Sum_percent
+}
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### FUNCTION - KU ET AL. (1995) LAG METHOD      ###
+###################################################
+### INPUTS:                                     ###
+### X = Original data matrix                    ###
+### The parallel analysis inside the function   ###
+### uses the 'paran' package and its default    ###
+### values                                      ###
+###                                             ###
+### OUTPUT:                                     ###
+###   A summarizing table with the information  ###
+###   in the steps of the procedure and a       ###
+###   numeric value with the lags in the        ###
+###   numeric part of the procedure             ###
+###################################################
+
+ku.et.al.1995 <- function(X){
+  
+  p = dim(X)[2] # Number of variables in X
+  save_r_l = rep(0,dim(X)[1])
+  save_r_new_l = rep(0,dim(X)[1])
+  
+  summary = matrix(rep(0),10 ,5)
+  colnames(summary) = c("lags (l)","Variables", "PCs retained",
+                        "r(l)","r_new(l)")
+  # 1. Set l = 0
+  lags = 0
+  
+  iter = 1 # Count variable to run/stop while loop.
+  
+  while(iter>0){
+    
+    # 2. Form data matrix
+    x <- X
+    
+    if(lags>0){
+      x <-Xlag(X,lags)
+    }
+    
+    # 3. Perform PCA and calculate scores
+    #    This step is not needed when using 'paran' package in Step 4.
+    
+    # 4. Set j and r (number of linear relations)
+    j = p*(lags+1)
+    r_l = 0
+    
+    # 5.Determine if the j:th component is a linear relation 
+    #   "r_l" is determined such that r_l = number of "low" eigenvalues - 1
+    #   in each stage. See p.186 in Ku et al. (1995).
+    #   The number of "low" eigenvalues can be determined by e.g. parallell analysis; 
+    #   here using the 'paran' package. 
+    
+    par = paran(x,quietly=TRUE, status=FALSE)$Retained
+    
+    r_l = (dim(x)[2]-par)
+    
+    save_r_l[lags+1]=r_l
+    
+    # 7. Number of new relationships r_new_l
+    if (lags==0){
+      r_new_l = r_l
+      save_r_new_l[1]=r_new_l
+      summary[1,1]=0
+      summary[1,2]=dim(x)[2]
+      summary[1,3]=par
+      summary[1,4:5]=r_l
+    }
+    
+    if (lags==1){
+      r_new_l = (r_l - 2*save_r_new_l[1])
+      save_r_new_l[2]=r_new_l
+      summary[2,1]=1
+      summary[2,2]=dim(x)[2]
+      summary[2,3]=par
+      summary[2,4]=r_l
+      summary[2,5]=r_new_l
+    }
+    
+    if (lags>1){
+      
+      sum = c(0)
+      for(i in 0:(lags-1)){
+        sum = sum + (lags-i+1)*save_r_new_l[i+1]
+      }  
+      
+      r_new_l = r_l-sum
+      save_r_new_l[lags+1]=r_new_l
+      
+      summary[(lags+1),1]=lags
+      summary[(lags+1),2]=dim(x)[2]
+      summary[(lags+1),3]=par
+      summary[(lags+1),4]=r_l
+      summary[(lags+1),5]=r_new_l
+    }
+    
+    # 8. If r_new(l) is less or equal to zero, go to 10. else proceed.
+    if (r_new_l <= 0){
+      iter = 0
+      lags = lags-1
+      break
+    }
+    
+    # 9. Update lags and go to step 2
+    lags = lags+1
+    
+    # 10. Stop
+  } # Closes while loop!  
+  
+  # Calculate PC scores based on chosen lag + 1
+  x = Xlag(X,lags+1)
+  PCA = princomp(x,cor=TRUE)$scores
+  
+  #Creating a cross correlation funtion plot among scores
+  #par(mfrow = c((lags+2),1))
+  #for (i in 1:(lags+2)){
+  #  ccf(PCA[,1],PCA[,(i*dim(X)[2])])  
+  #}
+  
+  print(summary[1:(lags+2),])
+  lags
+}
+
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### FUNCTION - RATO & REIS (2013) LAG METHOD    ###
+###################################################
+### INPUTS:                                     ###
+### X = Original data matrix                    ###
+### laglimit = limit for the number of lags to  ###
+###            test                             ###
+###                                             ###
+### OUTPUT:                                     ###
+###   Plots with Key Singular values, the       ###
+###   Key singular value ratios and the         ###
+###   objective function. A numeric value with  ###
+###   the maximum number of lags is given.      ###
+###################################################
+Rato.Reis.2013 <-function(X,laglimit){
+  
+  # Step 1. Set lag = 0 (l = 0)
+  
+  m = dim(X)[2] # Number of original variables.
+  
+  KSV = rep(0,laglimit+1) #Saving all Key Singular Values
+  KSVR = rep(0,laglimit+1) #Saving Key Singular Value Ratios
+  KSV[1] = eigen(cov(X))$values[1] #First Key Singular value
+  #(eigenvalue of covariance matrix)
+  
+  for (i in 1:(laglimit)){
+    
+    Xl <- Xlag(X,i) # Step 2 in Pseudocode
+    KSV[i+1] = eigen(cov(Xl))$values[(m*i)+1] # Step 3&4 in Pseudocode
+    if(i==1){
+      KSVR[i+1] = KSV[2]/KSV[1]
+    }
+    if(i>1){
+      KSVR[i+1] = KSV[i]/KSV[i-1] #Step 5 in Pseudocode
+    }
+    
+  }
+  is.na(KSVR) <-1 #Setting first KSVR value to "NA"
+  
+  KSVn = rep(0,laglimit+1) #Normalized Key Singular Values
+  
+  for(k in 1:(laglimit+1)){
+    KSVn[k]=(KSV[k]-min(KSV))/(max(KSV)-min(KSV))
+  }
+  
+  KSVRn = rep(0,laglimit+1) #Normalized Key Singular Value Ratios
+  maxKSVR =max(KSVR[2:(laglimit+1)]) # To avoid the "NA" value
+  minKSVR =min(KSVR[2:(laglimit+1)])
+  
+  for(k in 2:(laglimit+1)){
+    KSVRn[k]=(KSVR[k]-minKSVR)/(maxKSVR - minKSVR)
+  }
+  is.na(KSVRn) <-1 #Setting first KSVR value to "NA"
+  
+  
+  # Step 8 in the Pseudocode
+  objfunc = rep(0,laglimit+1)
+  
+  for(k in 2:(laglimit+1)){
+    objfunc[k] = sqrt((KSVn[k]^2)+(KSVRn[k]^2))
+  }
+  is.na(objfunc) <-1
+  
+  maxlag = which.min(objfunc)-1 #Detemines which lag minimizes objective function?
+  
+  x=c(0:laglimit) # For the x-axis in plots
+  
+  # One figure with 3 rows and 1 column
+  par(mfrow=c(3,1)) 
+  plot(x,KSV, type="p", xlab="No. of lags", ylab="Key Singular Value, KSV")
+  plot(x,KSVR, type="p", xlab="No. of lags", ylab="Key Singular Value Ratio, KSVR")
+  plot(x,objfunc, type="p", xlab="No. of lags", ylab="Objective function")
+  par(mfrow=c(1,1))  
+  
+  maxlag
+}
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### FUNCTION - EIGENVALUES OF LAGGED            ###
+### AUTOCORRELATION MATRICES BASED ON TSAY'S    ###
+### CODE                                        ###
+###################################################
+### INPUTS:                                     ###
+### X = Original data matrix                    ###
+### lags = Number of lags to test               ###
+### max_eig = Number of eigenvalues to plot in  ### 
+###           the figure                        ###
+###                                             ###
+### OUTPUT:                                     ###
+###   A plot of the Moduli of the eigenvalues   ###
+###   at different lags                         ###
+###                                             ###
+### WARNINGS: You will get a warning in the     ###
+###           function if all eiganvalues are   ###
+###           plotted since the 'rARPACK'       ### 
+###           package warns and suggest 'eigen' ###
+###           to be used instead.               ###
+###################################################
+eig.ccm <-function(X,lags,max_eig){
+  p = dim(X)[2]
+  
+  # For independent data to add help line in plot later
+  mu_ind = rep(0,p)
+  obs_ind = dim(X)[1]
+  sigma_ind = cor(X)
+  phi_ind = diag(p)*0
+  burn_ind = 500
+  Z= var1.sim(p,obs_ind,burn_ind,mu_ind,sigma_ind,phi_ind)
+  
+  
+  A<-as.array(ccm(X, lags = lags, level = TRUE, output = F)) 
+  B <- as.array(ccm(Z, lags = lags, level = TRUE, output = F)) 
+  
+  ccm<-A$ccm # A matrix with the components of the correlation matrices 
+  ccm_ind <-B$ccm
+  
+  eigval_k <- array(0, dim = c(lags+1,max_eig))
+  eigval_k_ind <- array(0, dim = c(lags+1,max_eig))
+  #corrmat_eig_k <- array(0, dim = c(lags+1,p,p))
+  
+  #'LA' below = "The k largest (algebraic) eigenvalues, considering any negative sign.
+  
+  for (i in 1:(lags+1)){
+    cormat_i <- matrix(ccm[,i],p,p)
+    cormat_i_ind <- matrix(ccm_ind[,i],p,p)
+    eigval_i <- Mod(eigs_sym(cormat_i,max_eig, which="LA",
+                             opts=list(retvec=FALSE))$values)
+    #eigvec_i <- eigen(cormat_i)$vectors
+    eigval_i_ind <- Mod(eigs_sym(cormat_i_ind,max_eig, which="LA",
+                                 opts=list(retvec=FALSE))$values)
+    eigval_k[i,] <- eigval_i
+    #corrmat_eig_k[i,,] <- eigvec_i
+    eigval_k_ind[i,] <- eigval_i_ind
+  }
+  
+  #Maximum of the eigenvalues for independent data in each lag (not zero lag)
+  max_eig_ind_lag = max(eigval_k_ind[2:(lags+1),])
+  
+  
+  par(mfrow=c(1,1))
+  v1 <- seq(0,lags,5) # defines position of tick marks.
+  matplot(0:lags,eigval_k,type="n",,xlab="lag",ylab="AVE", axes=FALSE)
+  axis(1,at = v1,tck=-.05)
+  axis(2,las=2)
+  minor.tick(nx = 5,ny = 1,tick.ratio=0.75)
+  
+  grid(col = "lightgray", lty = "dotted") # To get grid behind points('type='n')
+  par(new=TRUE)
+  matplot(0:lags,eigval_k,type="b",xaxt="n",yaxt="n",ann=FALSE)
+  abline(h = max_eig_ind_lag, lty="dashed", lwd=2)
+  
+} #Closes function
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### EIGENVALUES OF LAGGED PARTIAL               ###
+### AUTOCORRELATION MATRICES                    ###
+###################################################
+### INPUTS:                                     ###
+### X = Data Matrix                             ###
+### lags = Number of lags to test               ###
+### max_eig = Maximum number of eigenvalues     ###
+###           in the plot                       ###
+###                                             ###
+### OUTPUT:                                     ###
+###   A plot of the eigenvalues at different    ###
+###   lags                                      ###
+###                                             ###
+###################################################
+eig.p.corr <- function(X,lags,max_eig){
+  p = dim(X)[2]
+  
+  # For independent data to add help line in plot later
+  mu_ind = rep(0,p)
+  obs_ind = dim(X)[1]
+  sigma_ind = cor(X)
+  phi_ind = diag(p)*0
+  burn_ind = 500
+  Z= var1.sim(p,obs_ind,burn_ind,mu_ind,sigma_ind,phi_ind)
+  
+  savelagcor <- array(0, dim = c(lags,p,p))
+  saveeigpcor_i <- array(0, dim = c(lags,max_eig))
+  savelagcor_ind <- array(0, dim = c(lags,p,p))
+  saveeigpcor_i_ind <- array(0, dim = c(lags,max_eig))
+  
+  for (i in 1:lags){
+    Xlag = Xlag(X,i) #Creates a lagged matrix of data
+    Xlag_ind = Xlag(Z,i)
+    pcor_lag = pcor(Xlag)$estimate
+    pcor_lag_ind = pcor(Xlag_ind)$estimate
+    
+    pcormat = matrix(rep(0),p,p) #Starting a new p.corr.matrix
+    pcormat_ind = matrix(rep(0),p,p)
+    for (j in 1:p){
+      for (k in 1:p){
+        pcormat[j,k] =  pcor_lag[j,((i*p)+k)]
+        pcormat_ind[j,k] =  pcor_lag_ind[j,((i*p)+k)]# j = row, k = column
+      }   
+    } 
+    savelagcor[i,,] = pcormat
+    savelagcor_ind[i,,] = pcormat_ind
+    saveeigpcor_i[i,] = Mod(eigs(pcormat,max_eig, which="LR",
+                                 opts=list(retvec=FALSE))$values)
+    saveeigpcor_i_ind[i,] = Mod(eigs(pcormat_ind,max_eig, which="LR",
+                                     opts=list(retvec=FALSE))$values)
+  }
+  
+  #Maximum of the eigenvalues for independent data in each lag
+  max_eig_ind_lag = max(saveeigpcor_i_ind[2:(lags),])
+  
+  par(mfrow=c(1,1))
+  v1 <- seq(0,lags,5) # defines position of tick marks.
+  v1[1]=1 # sets the first tick mark to 1
+  
+  matplot(1:lags,saveeigpcor_i,type="n",xlab="lag",ylab="Absolute Value of the Eigenvalues",axes=FALSE)
+  axis(1,at = v1,tck=-.05)
+  axis(2,las=2)
+  minor.tick(nx = 5,ny = 1,tick.ratio=0.75)
+  
+  grid(col = "lightgray", lty = "dotted") # To get grid behind points('type='n')
+  par(new=TRUE)
+  matplot(1:lags,saveeigpcor_i,type="b",xaxt="n",yaxt="n", ann=FALSE)
+  abline(h = max(max_eig_ind_lag), lty="dashed", lwd=2)
+  
+} #closes function
+
+
+####################################################### FUNCTION
+################################################################
+###################################################
+### EIGENVECTORS OF LAGGED PARTIAL              ###
+### AUTOCORRELATION MATRICES                    ###
+###################################################
+### INPUTS:                                     ###
+### X = Data Matrix                             ###
+### lags = Number of lags to test               ###
+###                                             ###
+### OUTPUT:                                     ###
+###   ?
+###                                             ###
+###################################################
+eigvec.p.corr <- function(X,lags){
+  
+  p = dim(X)[2]
+  savelagcor <- array(0, dim = c(lags,p,p))
+  saveeigpcor_i <- array(0, dim = c(lags,p))
+  saveeigvecpcor_i <- array(0, dim = c(lags,p,p))
+  
+  for (i in 1:lags){
+    Xlag = Xlag(X,i) #Creates a lagged matrix of data
+    pcor_lag = pcor(Xlag)$estimate
+    
+    pcormat = matrix(rep(0),p,p) #Starting a new p.corr.matrix
+    for (j in 1:p){
+      for (k in 1:p){
+        pcormat[j,k] =  pcor_lag[j,((i*p)+k)] # j = row, k = column
+      }   
+    } 
+    savelagcor[i,,] = pcormat
+    saveeigpcor_i[i,] = Mod(eigen(pcormat)$values)
+    saveeigvecpcor_i[i,,] = eigen(pcormat)$vectors
+  }
+  
+  par(mfrow=c(1,1))
+  x_label = seq(1,lags,1)
+  matplot(x_label,saveeigpcor_i,type="b",xlab="lag",ylab="Mod(Eigenvalues)",
+          main="Modulus of Eigenvalues of Partial autocorrelation Matrices")
+  
+  saveeigvecpcor_i
+} #closes function
+
+
+
+```
+
+
+In the following code snippet we load our data and difference the data as described in the main report.
+
+```{r}
+library(R.matlab)
+
+# Loading the data from a matfile that contains all of the data sets
+Data_XY <- readMat("/Users/Sebastian/Documents/Leif/DTU/Speciale/Runs/Data_XY.mat")
+
+
+# Loading the data from the anaerobic digester influent and effluent and differencing it as described in the main report with respect to the prior days observation and the prior observation
+AD_influent_diff <- diff(diff(scale(Data_XY$AD.influent), lag = 96), lag=1)
+AD_effluent_diff <- diff(diff(scale(Data_XY$AD.effluent), lag = 96), lag=1)
+
+
+
+# Loading the data from the different locations in the activated sludge process and differencing it as described in the main report with respect to the prior days observation and the prior observation
+
+# For locations a-f kLa is removed since the variable value is zero, and this prevents some of the code from running, since it is unable to calculate eigenvalues
+location_a_diff <- diff(diff(scale(Data_XY$location.a[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_b_diff <- diff(diff(scale(Data_XY$location.b[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_c_diff <- diff(diff(scale(Data_XY$location.c[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_d_diff <- diff(diff(scale(Data_XY$location.d[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_e_diff <- diff(diff(scale(Data_XY$location.e[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_f_diff <- diff(diff(scale(Data_XY$location.f[,c(1,2,3,4,5,6,7,9,10,11,12,13)]), lag = 96), lag = 1)
+location_g_diff <- diff(diff(scale(Data_XY$location.g), lag = 96), lag = 1)
+location_h_diff <- diff(diff(scale(Data_XY$location.h), lag = 96), lag = 1)
+location_i_diff <- diff(diff(scale(Data_XY$location.i), lag = 96), lag = 1)
+
+
+```
+
+
+For both of the methods all lags upto lag 20 are investigated for the two methods.
+The 10 in eig.p.corr(AD_influent_diff, 20, 10) corresponds to how many of the eigenvalues are shown which is equivalent to the number of variables in the dataset (both X and y), so for the AD it is 10, for the AS loc a-f it is 12 and for the AS g-i it is 13
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(AD_influent_diff, 20, 10)
+Rato.Reis.2013(AD_influent_diff,20)
+```
+
+
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(AD_effluent_diff, 20, 10)
+Rato.Reis.2013(AD_effluent_diff,20)
+```
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_a_diff, 20, 12)
+Rato.Reis.2013(location_a_diff,20)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_b_diff, 20, 12)
+Rato.Reis.2013(location_b_diff,20)
+```
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_c_diff, 20, 12)
+Rato.Reis.2013(location_c_diff,20)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_d_diff, 20, 12)
+Rato.Reis.2013(location_d_diff,20)
+```
+
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_e_diff, 20, 12)
+Rato.Reis.2013(location_e_diff,20)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_f_diff, 20, 12)
+Rato.Reis.2013(location_f_diff,20)
+```
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_g_diff, 20, 13)
+Rato.Reis.2013(location_g_diff,20)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_h_diff, 20, 13)
+Rato.Reis.2013(location_h_diff,20)
+```
+
+
+
+
+```{r}
+par(mfrow=c(1,2))
+eig.p.corr(location_i_diff, 20, 13)
+Rato.Reis.2013(location_i_diff,20)
+```
+
+
